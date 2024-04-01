@@ -3,6 +3,7 @@
 from minio import Minio
 from minio.commonconfig import CopySource
 import sys
+import io
 import argparse
 import htcondor
 import htcondor.dags
@@ -59,7 +60,7 @@ were completed successfully. In other words, it provides us with state tracking 
 
 Documentation for DAGMan can be found at https://htcondor.readthedocs.io/en/latest/automated-workflows/index.html
 '''
-def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, s3conf):
+def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, s3conf):
     # Get the abs path of the current dir before we switch dirs so we can send the executable
     # cogs.sh
     cwd = os.getcwd()
@@ -89,16 +90,16 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, s3conf):
         "container_image":         "docker://osgeo/gdal:ubuntu-small-3.6.3",
 
         # Set up logging info
-        "log":                     "$(CLUSTER).log",
-        "output":                  "$(CLUSTER).out",
-        "error":                   "$(CLUSTER).err",
+        "log":                     "$(INFILE).log",
+        "output":                  "$(INFILE).out",
+        "error":                   "$(INFILE).err",
 
         # Set up the stuff we actually run
         # Note: In theory we're one directory deeper than the execution context of the script
         # so we grab the executable from up a dir.
         "executable":              "../generate_cogs.sh",
         # "COGFILE":                 "cog_$(INFILE)",
-        "arguments":               "$(INFILE) cog_$(INFILE) $(OUTFILE) $(BANDS)",
+        "arguments":               "$(INFILE) $(BANDS)",
 
         # And requirements for running stuff
         "request_disk":            "1GB",
@@ -117,15 +118,15 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, s3conf):
 
     # Generate input args from the CSVs we read earlier
     input_args = [{
-        "node_name": "test-node",
+        "node_name": "cog-pipeline-node",
         # Condor will flatten anything from S3 that looks like a subfolder, eg subfolder/my-image.tif gets
         # downloaded as my-image.tif. We need to keep track of the full path so we can transfer it back to the
         # output bucket.
         "FULL_INFILE": files[idx][0],
         "INFILE": ((files[idx][0]).split("/"))[-1],
-        "FULL_OUTFILE": files[idx][1],
-        "OUTFILE": ((files[idx][1]).split("/"))[-1],
-        "BANDS": files[idx][2]} for idx in range(len(files))]
+        "FULL_OUTFILE": (files[idx][0]).replace(".tif", ".jpg"),
+        "OUTFILE": (((files[idx][0]).split("/"))[-1]).replace(".tif", ".jpg"),
+        "BANDS": files[idx][1]} for idx in range(len(files))]
     print("ABOUTY TO SUBMIT EP JOBS WITH INPUT ARGS: ", input_args)
 
     # Set up our post script -- this is how we manage state tracking to determine which jobs were actually successful
@@ -138,7 +139,7 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, s3conf):
     # Set up the DAG we use as a job runner
     dag = htcondor.dags.DAG()
     dag.layer(
-        name = "sco-geotiff-dag",
+        name = f"COG-Pipeline-DAG-{pattern}",
         submit_description = submit_description,
         vars = input_args,
         # Allow each individual job to retry itself a max of 3 times
@@ -155,7 +156,7 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, s3conf):
 
     dag_file = htcondor.dags.write_dag(dag, os.getcwd(), node_name_formatter=htcondor.dags.SimpleFormatter("_"))
     dag_submit = htcondor.Submit.from_dag(str(dag_file), {
-        'batch-name': "sco-geotiff-dag",
+        'batch-name': f"COG-Pipeline-DAG-{pattern}",
         # Hardcode that we don't want more than 10k jobs running at once
         'maxjobs': 10000,
     })
@@ -204,7 +205,7 @@ def submit_crondor(in_bucket, out_bucket, pattern, s3conf):
         "getenv":                  "true",
 
         # Finally, set the batch name so we know this is a crondor job
-        "JobBatchName":            f"SCO-Crondor-{pattern}",
+        "JobBatchName":            f"COG-Pipeline-Crondor-{pattern}",
     })
 
     schedd = htcondor.Schedd()
@@ -228,18 +229,18 @@ def rename_object(bucket, obj_rename_map, s3conf):
         except Exception as e:
             raise Exception(f"Command failed: {str(e)}")
 
-# Given a bucket and a list of local files, put the objects into the remote bucket
-def put_object(bucket, object_list, s3conf):
+# Given a bucket and a map of local-->remote file names, put the objects into the remote bucket
+def put_object(bucket, object_map, s3conf):
     # Initialize the Minio client
     minioClient = Minio(s3conf.endpoint,
                         access_key=s3conf.access_key,
                         secret_key=s3conf.secret_key,
                         secure=True)
 
-    for obj in object_list:
-        print(f"MOVING {obj} to {bucket}/{obj}")
+    for local_name, remote_name in object_map.items():
+        print(f"MOVING {local_name} to {bucket}/{remote_name}")
         try:
-            minioClient.fput_object(bucket, obj, obj)
+            minioClient.fput_object(bucket, remote_name, local_name)
         except Exception as e:
             raise Exception(f"Command failed: {str(e)}")
 
@@ -259,7 +260,7 @@ def remove_object(bucket, object_list, s3conf):
             raise Exception(f"Command failed: {str(e)}")
 
 # Given a bucket and a list of objects, fetch the objects from the bucket
-def fetch_objects(bucket, object_list, s3conf):
+def fetch_input_objects(bucket, object_list, s3conf):
     # Initialize the Minio client
     minioClient = Minio(s3conf.endpoint,
                         access_key=s3conf.access_key,
@@ -269,11 +270,13 @@ def fetch_objects(bucket, object_list, s3conf):
     for obj in object_list:
         try:
             data = minioClient.get_object(bucket, obj)
-            with open(obj, 'wb') as file_data:
+
+            # The input CSV may be nested in an S3 "subfolder". We flatten that here.
+            with open(obj.split("/")[-1], 'wb') as file_data:
                 for d in data.stream(32*1024):
                     file_data.write(d)
         except Exception as e:
-            raise Exception(f"Failed to fetch_objects: {str(e)}")
+            raise Exception(f"Failed to fetch__input_objects: {str(e)}")
 
 # Given a bucket and a glob-like pattern, determine any files in the bucket that match
 def get_matching_objects(bucket, pattern, s3conf):
@@ -311,29 +314,43 @@ def crondorMain():
     matching_files = get_matching_objects(args.input_bucket, args.pattern, s3conf)
     if len(matching_files) > 0:
         print("MATCHING FILES: ", matching_files)
-        fetch_objects(args.input_bucket, matching_files, s3conf)
+        fetch_input_objects(args.input_bucket, matching_files, s3conf)
         print(f"Downloaded {len(matching_files)} files")
        
+        # We downloaded the remote objects, and in the process we flattened
+        # any S3 subfolders. Now we update the matching files list to reflect that.
+        local_matching_files = [f.split("/")[-1] for f in matching_files]
+
         rename_map = {}
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         # Create a timestamped directory to store the files in
         workflow_dir = "workflow-run-" + timestamp
         os.makedirs(workflow_dir, exist_ok=True)
-        for index, file in enumerate(matching_files):
+
+        # We have two things to do. First, we ned to rename the file locally to indicate we're processing
+        # Second, we need to rename the remote file to prevent any re-processing
+        for index, file in enumerate(local_matching_files):
             # FOR NOW WE ASSUME EVERY FILE ENDS IN raw.csv
             # TODO: Make this work with the glob pattern
-            rename_map[file] = f"{file[0:-7]}processing-{timestamp}.csv"
+
+            # Create a base filename that contains our timestamp
+            file_base = f"{file[0:-7]}processing-{timestamp}.csv"
+
+            # Create the rename map for the remote file by stripping off the file and adding the new base
+            remote_parts = matching_files[index].split("/")
+            new_remote_path = "/".join(remote_parts[0:-1] + [file_base])
+            rename_map[matching_files[index]] = new_remote_path
 
             # Also, save the files locally
-            os.rename(file, f"{workflow_dir}/{rename_map[file]}")
+            os.rename(file, f"{workflow_dir}/{file_base}")
 
             # Update the name of the file in the list. We don't need the workflow dir,
             # to be included, because we'll be executing the DAG from the context of the 
             # workflow directory
-            matching_files[index] = f"{rename_map[file]}"
+            local_matching_files[index] = f"{file_base}"
 
         # We now have the files, use them to submit the actual workflow
-        submit_DAG(args.input_bucket, args.output_bucket, matching_files, workflow_dir, s3conf)
+        submit_DAG(args.input_bucket, args.output_bucket, local_matching_files, workflow_dir, args.pattern, s3conf)
 
         # Finally, rename the remote objects to prevent re-processing
         rename_object(args.input_bucket, rename_map, s3conf)
@@ -379,48 +396,84 @@ def postScript():
     parser.add_argument("-e", "--s3-endpoint", help="The hostname of the s3 endpoint to connect to. Defaults to https://s3dev.chtc.wisc.edu.")
     args = parser.parse_args()
 
-    s3conf = S3Config(args.access_key, args.secret_key, args.s3_endpoint)
+    # DAGMan doesn't capture stdout/stderr from our post script, so we do that and manually create a file
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    sys.stdout = stdout_buf
+    sys.stderr = stderr_buf
 
-    # All of the "processing" files are downloaded to the AP. For each match, we check the output bucket
-    for file in glob.glob("*processing-*"):
-        successful_files = []
-        failed_files = []
-        with open(file, 'r') as processing_file:
-            csv_reader = csv.reader(processing_file)
-        
-            for row in csv_reader:
-                # We know there should be an output tif and an output jpg in the first two columns
-                tif_im = row[0]
-                jpg_im = row[1]
-                
-                if len(get_matching_objects(args.output_bucket, tif_im, s3conf)) > 0 and len(get_matching_objects(args.output_bucket, jpg_im, s3conf)) > 0:
-                    # Objects found!
-                    successful_files.append(row)
-                else:
-                    # Whoops, something isn't right :(
-                    failed_files.append(row)
+    try:
+        s3conf = S3Config(args.access_key, args.secret_key, args.s3_endpoint)
 
-        copy_list = []
-        if len(successful_files) > 0:
-            fname = file.replace("processing", "processed")
-            with open(fname, 'w') as processed:
-                csv_writer = csv.writer(processed)
-                csv_writer.writerows(successful_files)
-            copy_list.append(fname)
+        # All of the "processing" files are downloaded to the AP. For each match, we check the output bucket.
+        # Based on contents of output bucket, we determine which files to write back to the input bucket.
+        for file in glob.glob("*processing-*"):
+            successful_files = []
+            failed_files = []
+            with open(file, 'r') as processing_file:
+                csv_reader = csv.reader(processing_file)
 
-        if len(failed_files) > 0:
-            fname = file.replace("processing", "failed")
-            with open(fname, 'w') as failed:
-                csv_writer = csv.writer(failed)
-                csv_writer.writerows(failed_files)
-            copy_list.append(fname)
+                for row in csv_reader:
+                    # We know there should be an output tif and an output jpg in the first two columns
+                    tif_im = row[0]
+                    jpg_im = tif_im.replace(".tif", ".jpg")
 
-        # Copy the new files back to the input bucket and delete the "processing" file
-        put_object(args.input_bucket, copy_list, s3conf)
-        remove_object(args.input_bucket, [file], s3conf)
+                    if len(get_matching_objects(args.output_bucket, tif_im, s3conf)) > 0 and len(get_matching_objects(args.output_bucket, jpg_im, s3conf)) > 0:
+                        # Objects found!
+                        successful_files.append(row)
+                    else:
+                        # Whoops, something isn't right :(
+                        failed_files.append(row)
 
-        for f in copy_list:
-            os.remove(f)
+            # Here we determine which files we're going to delete from the input bucket, along with their path,
+            # which we use for storing our post-processing files.
+            # NOTE: We've already made the assumption that all processing files have a UNIQUE BASE NAME, so this list
+            # MUST have only one element!!!
+            remote_file_to_rename = get_matching_objects(args.input_bucket, f"*{file}", s3conf)[0]
+            remote_path = "/".join(remote_file_to_rename.split("/")[0:-1])
+
+            copy_map = {}
+            if len(successful_files) > 0:
+                fname = file.replace("processing", "processed")
+                with open(fname, 'w') as processed:
+                    csv_writer = csv.writer(processed)
+                    csv_writer.writerows(successful_files)
+                copy_map[fname] = remote_path+"/"+fname
+
+            if len(failed_files) > 0:
+                fname = file.replace("processing", "failed")
+                with open(fname, 'w') as failed:
+                    csv_writer = csv.writer(failed)
+                    csv_writer.writerows(failed_files)
+                copy_map[fname] = remote_path+"/"+fname
+
+
+            # Copy the new files back to the input bucket and delete the "processing" file
+            put_object(args.input_bucket, copy_map, s3conf)
+
+            for f in copy_map.keys():
+                os.remove(f)
+
+            # Designate all the remote files matching the current file for deletion
+            remove_object(args.input_bucket, [remote_file_to_rename], s3conf)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    finally:
+        # After post script work is done or in case of an error, retrieve the contents of the buffers
+        stdout_content = stdout_buf.getvalue()
+        stderr_content = stderr_buf.getvalue()
+
+        # Write the contents of the buffers to files
+        with open('post.out', 'w') as f:
+            f.write(stdout_content)
+        with open('post.err', 'w') as f:
+            f.write(stderr_content)
+
+        # Revert stdout and stderr back to their original states. Probably don't need to do this, but can't hurt.
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
 
 def main():
     if len(sys.argv) > 1:
