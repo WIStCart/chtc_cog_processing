@@ -73,13 +73,13 @@ This script assumes access to an input and output bucket (which may be the same 
 
 To launch the Crondor job, run:
 ```
-python3 cog_pipeline.py  -a <ACCESS KEY FILE PATH> -s <SECRET KEY FILE PATH> -e <S3 ENDPOINT URL> --input-bucket <INPUT BUCKET> --output-bucket <OUTPUT BUCKET> -p "*raw.csv"
+python3 cog_pipeline.py  -a <ACCESS KEY FILE PATH> -s <SECRET KEY FILE PATH> -e <S3 ENDPOINT URL> --input-bucket <INPUT BUCKET> --output-bucket <OUTPUT BUCKET> --max-running <num concurrent jobs> -p "*raw.csv"
 ```
 
 Example:
 
 ```
-python3 cog_pipeline.py -a ~/rmls3_keyid.txt -s ~/rmls3_accesskey.txt -e web.s3.wisc.edu --input-bucket rml-chtc-inputs --output-bucket rml-chtc-outputs -p "*raw.csv"
+python3 cog_pipeline.py -a ~/rmls3_keyid.txt -s ~/rmls3_accesskey.txt -e web.s3.wisc.edu --input-bucket rml-chtc-inputs --output-bucket rml-chtc-outputs --max-running 500 -p "*raw.csv"
 ```
 
 The above only needs to be run once.  The Crondor job will run indefinitely, and does not need to be re-run at next time the user logs in.  As a best practice, it would be best to kill the Crondor job with a `condor_rm {username}` if there will no image processing happening for a long period of time.  
@@ -88,10 +88,24 @@ When matching files are found in the input bucket, a new directory is created wh
 
 ## Troubleshooting
 
-**NOTE:** If any jobs are placed on hold with an error that indicates job credentials aren't available, try running
+### Diagnosing Held Jobs
+
+> **NOTE:** If any jobs are placed on hold with an error that indicates job credentials aren't available, try running
 `condor_submit scitokens_workaround.sub` before launching the DAG. This submits a hold job that forces Condor
 to make fresh credentials available to the DAG.
 
+Another potential issue can occur if too many jobs hammer the S3 endpoint at once. Held jobs that indicate this may be happening
+will have hold messages similar to:
+```
+<Job ID>   <your username>       4/10 12:47 Transfer input files failure at execution point slot1_118@e4029.chtc.wisc.edu using protocol https. Details: Error from slot1_118@e4029.chtc.wisc.edu: FILETRANSFER:1:non-zero exit (1) from /usr/libexec/condor/curl_plugin. |Error: Aborted due to lack of progress (with environment: http_proxy='http://squid-cs-2360.chtc.wisc.edu:3128', https_proxy='') ( URL file = <URL of the file that failed to download>?... )|
+```
+
+You can see the reason for a held job by running `condor_q -hold <JOB ID>`  or for all of your jobs by running `condor_q -hold <your username>`
+
+If too many held jobs begin accumulating, they can be released with `condor_release <JOB ID>` for individual jobs or with `condor_release -constraint 'JobBatchName=="COG-Pipeline-Crondor-<insert the pattern here>"'`. Another troubleshooting step may be to re-submit the workflow with a lower value for
+`--max-running`.
+
+### Other Types of Failure
 If you believe some job encountered a different error, there are several files worth examining.
 
 First, the directory from which you ran `python3 cog_pipeline.py` will have 3 files you can check for debugging info related to
