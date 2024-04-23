@@ -114,6 +114,13 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, max_
         "transfer_output_remaps":  f"\"$(INFILE) = s3://{s3conf.endpoint}/{out_bucket}/$(FULL_INFILE); $(OUTFILE) = s3://{s3conf.endpoint}/{out_bucket}/$(FULL_OUTFILE);\"",
         "should_transfer_files":   "YES",
         "when_to_transfer_output": "ON_EXIT",
+
+        # Release the job after an amount of time that increases exponentially with the number of retries (this is a backoff strategy to give
+        # the S3 endpoint time to recover if it's overloaded)
+        "periodic_release": f"((time() - EnteredCurrentStatus) >= ((((ClusterId % {int(int(max_running)/10)}) * 60) + 60) * pow(2, NumHolds)))",
+
+        # Remove the job if RetryCount exceeds 5
+        "periodic_remove": "NumHolds > 5",
     })
 
     # Generate input args from the CSVs we read earlier
