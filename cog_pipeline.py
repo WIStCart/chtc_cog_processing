@@ -60,7 +60,7 @@ were completed successfully. In other words, it provides us with state tracking 
 
 Documentation for DAGMan can be found at https://htcondor.readthedocs.io/en/latest/automated-workflows/index.html
 '''
-def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, s3conf):
+def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, max_running, s3conf):
     # Get the abs path of the current dir before we switch dirs so we can send the executable
     # cogs.sh
     cwd = os.getcwd()
@@ -114,6 +114,13 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, s3co
         "transfer_output_remaps":  f"\"$(INFILE) = s3://{s3conf.endpoint}/{out_bucket}/$(FULL_INFILE); $(OUTFILE) = s3://{s3conf.endpoint}/{out_bucket}/$(FULL_OUTFILE);\"",
         "should_transfer_files":   "YES",
         "when_to_transfer_output": "ON_EXIT",
+
+        # Release the job after an amount of time that increases exponentially with the number of retries (this is a backoff strategy to give
+        # the S3 endpoint time to recover if it's overloaded)
+        "periodic_release": f"((time() - EnteredCurrentStatus) >= ((((ClusterId % {int(int(max_running)/10)}) * 60) + 60) * pow(2, NumHolds)))",
+
+        # Remove the job if RetryCount exceeds 5
+        "periodic_remove": "NumHolds > 5",
     })
 
     # Generate input args from the CSVs we read earlier
@@ -158,7 +165,7 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, s3co
     dag_submit = htcondor.Submit.from_dag(str(dag_file), {
         'batch-name': f"COG-Pipeline-DAG-{pattern}",
         # Hardcode that we don't want more than 10k jobs running at once
-        'maxjobs': 10000,
+        'maxjobs': max_running,
     })
 
     print("Submitting DAG job...")
@@ -174,13 +181,13 @@ monitor the input bucket for new CSV files that contain job information for each
 we need to process. Because of this, the CSV files shouldn't be uploaded until we know all of the
 files indicated in the file have successfully uploaded.
 '''
-def submit_crondor(in_bucket, out_bucket, pattern, s3conf):
+def submit_crondor(in_bucket, out_bucket, pattern, max_running, s3conf):
     script_path = str(pathlib.Path(sys.argv[0]).absolute())
     print("SCRIPT PATH: ", script_path)
 
     submit_description = htcondor.Submit({
         "executable":              script_path,
-        "arguments":               f"crondor --input-bucket {in_bucket} --output-bucket {out_bucket} -p {pattern} -s {s3conf.secret_key_file} -a {s3conf.access_key_file} -e {s3conf.endpoint}",
+        "arguments":               f"crondor --input-bucket {in_bucket} --output-bucket {out_bucket} -p {pattern} -s {s3conf.secret_key_file} -a {s3conf.access_key_file} -e {s3conf.endpoint} -m {max_running}",
         "universe":                "local",
         "request_disk":            "512MB",
         "request_cpus":            1,
@@ -306,6 +313,7 @@ def crondorMain():
     parser.add_argument("-s", "--secret-key", help="The secret key file to use for the S3 connection.")
     parser.add_argument("-a", "--access-key", help="The access key file to use for the S3 connection.")
     parser.add_argument("-e", "--s3-endpoint", help="The hostname of the s3 endpoint to connect to. Defaults to s3dev.chtc.wisc.edu.")
+    parser.add_argument("-m", "--max-running", help="The maximum number of jobs to run at once.", default=10000)
     args = parser.parse_args()
 
     s3conf = S3Config(args.access_key, args.secret_key, args.s3_endpoint)
@@ -350,7 +358,7 @@ def crondorMain():
             local_matching_files[index] = f"{file_base}"
 
         # We now have the files, use them to submit the actual workflow
-        submit_DAG(args.input_bucket, args.output_bucket, local_matching_files, workflow_dir, args.pattern, s3conf)
+        submit_DAG(args.input_bucket, args.output_bucket, local_matching_files, workflow_dir, args.pattern, args.max_running, s3conf)
 
         # Finally, rename the remote objects to prevent re-processing
         rename_object(args.input_bucket, rename_map, s3conf)
@@ -368,10 +376,11 @@ def topMain():
     parser.add_argument("-s", "--secret-key", help="The secret key file to use for the S3 connection.")
     parser.add_argument("-a", "--access-key", help="The access key file to use for the S3 connection.")
     parser.add_argument("-e", "--s3-endpoint", help="The hostname of the s3 endpoint to connect to. Defaults to https://s3dev.chtc.wisc.edu.")
+    parser.add_argument("-m", "--max-running", help="The maximum number of jobs to run at once.", default=10000)
     args = parser.parse_args()
 
     s3conf = S3Config(args.access_key, args.secret_key, args.s3_endpoint)
-    submit_crondor(args.input_bucket, args.output_bucket, args.pattern, s3conf)
+    submit_crondor(args.input_bucket, args.output_bucket, args.pattern, args.max_running, s3conf)
     return 0
 
 '''
