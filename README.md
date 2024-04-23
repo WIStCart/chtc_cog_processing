@@ -79,7 +79,7 @@ python3 cog_pipeline.py  -a <ACCESS KEY FILE PATH> -s <SECRET KEY FILE PATH> -e 
 Example:
 
 ```
-python3 cog_pipeline.py -a ~/rmls3_keyid.txt -s ~/rmls3_accesskey.txt -e web.s3.wisc.edu --input-bucket rml-chtc-inputs --output-bucket rml-chtc-outputs --max-running 500 -p "*raw.csv"
+python3 cog_pipeline.py -a ~/chtc_access.key -s ~/chtc_secret.key -e s3dev.chtc.wisc.edu --input-bucket inputs --output-bucket outputs -p "*raw.csv"
 ```
 
 The above only needs to be run once.  The Crondor job will run indefinitely, and does not need to be re-run at next time the user logs in.  As a best practice, it would be best to kill the Crondor job with a `condor_rm {username}` if there will no image processing happening for a long period of time.  
