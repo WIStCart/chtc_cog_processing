@@ -102,7 +102,7 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, max_
         "arguments":               "$(INFILE) $(BANDS)",
 
         # And requirements for running stuff
-        "request_disk":            "1GB",
+        "request_disk":            "2GB",
         "request_memory":          "1GB",
         "request_cpus":            1,
         
