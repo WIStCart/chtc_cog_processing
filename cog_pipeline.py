@@ -77,7 +77,7 @@ def submit_DAG(in_bucket, out_bucket, csv_file_list, workflow_dir, pattern, max_
     files = []
     for csv_file in csv_file_list:
         print("READING CSV FILE: ", csv_file)
-        with open(csv_file, 'r', newline='') as csv_file:
+        with open(csv_file, 'r', newline='', encoding='utf-8-sig') as csv_file:
             csv_reader = csv.reader(csv_file)
             for row in csv_reader:
                 files.append(tuple(row))
